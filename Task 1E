@@ -1,0 +1,873 @@
+
+;----- RCC Registers -----
+RCC_AHB1ENR     EQU     0x40023830
+RCC_APB1ENR     EQU     0x40023840
+RCC_APB2ENR     EQU     0x40023844
+
+;----- GPIOA Registers -----
+GPIOA_MODER     EQU     0x40020000
+
+;----- GPIOB Registers -----
+GPIOB_MODER     EQU     0x40020400
+GPIOB_OTYPER    EQU     0x40020404
+GPIOB_OSPEEDR   EQU     0x40020408
+GPIOB_PUPDR     EQU     0x4002040C
+GPIOB_AFRH      EQU     0x40020424
+
+;----- I2C1 Registers -----
+I2C1_CR1        EQU     0x40005400
+I2C1_CR2        EQU     0x40005404
+I2C1_DR         EQU     0x40005410
+I2C1_SR1        EQU     0x40005414
+I2C1_SR2        EQU     0x40005418
+I2C1_CCR        EQU     0x4000541C
+I2C1_TRISE      EQU     0x40005420
+
+;----- ADC1 Registers -----
+ADC1_SR         EQU     0x40012000
+ADC1_CR1        EQU     0x40012004
+ADC1_CR2        EQU     0x40012008
+ADC1_SMPR2      EQU     0x40012010
+ADC1_SQR1       EQU     0x4001202C
+ADC1_SQR3       EQU     0x40012034
+ADC1_DR         EQU     0x4001204C
+
+;----- OLED Constants -----
+OLED_ADDR_W     EQU     0x78
+
+;----- Resistor thresholds -----
+; With R_known = 1k:
+;   330 ohm  -> ADC ~ 1017, R_calc ~ 330
+;   4.7k ohm -> ADC ~ 3375, R_calc ~ 4700
+; Midpoint threshold: ~2000 ohms separates the two
+THRESHOLD       EQU     2000
+
+
+                AREA    asm_area, CODE, READONLY
+                EXPORT  __main
+
+__main
+                BL      SystemClock_Config
+                BL      ADC1_GPIO_Init
+                BL      ADC1_Init
+                BL      I2C1_GPIO_Init
+                BL      I2C1_Init
+                
+                LDR     R0, =800000
+PwrUp           SUBS    R0, R0, #1
+                BNE     PwrUp
+                
+                BL      OLED_Init
+                
+                LDR     R0, =200000
+PostInit        SUBS    R0, R0, #1
+                BNE     PostInit
+                
+                BL      OLED_ClearScreen
+
+
+; Main Loop: Read ADC, calculate resistance, display
+
+MainLoop
+                BL      OLED_ClearBuffer
+                
+                ; Row 1: "OHM METER"
+                LDR     R0, =Msg_Title
+                MOV     R1, #0
+                MOV     R2, #0
+                BL      OLED_DrawString
+                
+                ; Take 32 ADC samples and average
+                MOV     R9, #0          ; accumulator
+                MOV     R10, #32        ; sample count
+SampleLoop
+                BL      ADC1_Read
+                ADD     R9, R9, R0
+                LDR     R0, =5000
+SmpDly          SUBS    R0, R0, #1
+                BNE     SmpDly
+                SUBS    R10, R10, #1
+                BNE     SampleLoop
+                
+                ; Average: divide by 32 (shift right 5)
+                LSR     R0, R9, #5      ; R0 = averaged ADC value
+                MOV     R9, R0          ; Save averaged ADC in R9
+                
+                ; Calculate R_unknown = 1000 * ADC / (4095 - ADC)
+                ; First: denominator = 4095 - ADC
+                LDR     R1, =4095
+                SUB     R1, R1, R9      ; R1 = 4095 - ADC
+                
+                ; Guard: if denominator <= 0, show error
+                CMP     R1, #1
+                BLT     ShowError
+                
+                ; Numerator = 1000 * ADC
+                LDR     R2, =1000
+                MUL     R0, R9, R2      ; R0 = 1000 * ADC
+                
+                ; R0 = R0 / R1 (numerator / denominator)
+                BL      UDiv            ; R0 = R_unknown in ohms
+                MOV     R9, R0          ; R9 = calculated resistance
+                
+                ; Now format and display the resistance value
+                ; Also write raw ohm value to ResBuf
+                BL      FormatResistance
+                
+                ; Draw Row 2: resistance string
+                LDR     R0, =ResBuf
+                MOV     R1, #0
+                MOV     R2, #2
+                BL      OLED_DrawString
+                
+                B       UpdateAndWait
+
+ShowError
+                LDR     R0, =Msg_Error
+                MOV     R1, #0
+                MOV     R2, #2
+                BL      OLED_DrawString
+
+UpdateAndWait
+                BL      OLED_UpdateDisplay
+                
+                LDR     R0, =2000000
+ReadDly         SUBS    R0, R0, #1
+                BNE     ReadDly
+                
+                B       MainLoop
+
+                LTORG
+
+
+; FormatResistance: Convert R9 (ohms) to display string in ResBuf
+; Identifies whether 330 ohm or 4.7k ohm based on threshold
+; Also shows raw measured value
+
+FormatResistance
+                PUSH    {R0-R7, LR}
+                LDR     R5, =ResBuf
+                
+                ; Check if resistance is below or above threshold
+                LDR     R0, =THRESHOLD
+                CMP     R9, R0
+                BHS     Format_kOhm
+                
+;---- Format as XXX Ohm (for ~330 range) ----
+Format_Ohm
+                MOV     R4, R9          ; R4 = resistance value
+                
+                ; Hundreds digit
+                MOV     R0, R4
+                MOV     R1, #100
+                BL      UDiv
+                MOV     R6, R0          ; R6 = hundreds
+                MOV     R1, #100
+                MUL     R1, R6, R1
+                SUB     R4, R4, R1
+                
+                ; Only print hundreds if non-zero
+                CMP     R6, #0
+                BEQ     SkipHundreds
+                ADD     R0, R6, #0x30
+                STRB    R0, [R5], #1
+SkipHundreds
+                ; Tens digit
+                MOV     R0, R4
+                MOV     R1, #10
+                BL      UDiv
+                MOV     R6, R0
+                MOV     R1, #10
+                MUL     R1, R6, R1
+                SUB     R4, R4, R1
+                
+                ADD     R0, R6, #0x30
+                STRB    R0, [R5], #1
+                
+                ; Ones digit
+                ADD     R0, R4, #0x30
+                STRB    R0, [R5], #1
+                
+                ; Write " Ohm"
+                MOV     R0, #0x20       ; space
+                STRB    R0, [R5], #1
+                MOV     R0, #0x4F       ; 'O'
+                STRB    R0, [R5], #1
+                MOV     R0, #0x68       ; 'h'
+                STRB    R0, [R5], #1
+                MOV     R0, #0x6D       ; 'm'
+                STRB    R0, [R5], #1
+                MOV     R0, #0x00       ; null
+                STRB    R0, [R5]
+                
+                B       FormatResDone
+
+;Format as X.X kOhm (for ~4700 range)
+Format_kOhm
+                MOV     R4, R9          ; R4 = resistance value in ohms
+                
+                ; Convert to tenths of kOhm: (R4 + 50) / 100
+                ; This gives us value in units of 0.1 kOhm
+                ADD     R4, R4, #50     ; round
+                MOV     R0, R4
+                MOV     R1, #100
+                BL      UDiv
+                MOV     R4, R0          ; R4 = tenths of kOhm (e.g., 47 for 4.7k)
+                
+                ; Integer part (tens of kOhm)
+                MOV     R0, R4
+                MOV     R1, #10
+                BL      UDiv
+                MOV     R6, R0          ; R6 = integer kOhm digit
+                MOV     R1, #10
+                MUL     R1, R6, R1
+                SUB     R4, R4, R1      ; R4 = fractional digit
+                
+                ; Write integer digit
+                ADD     R0, R6, #0x30
+                STRB    R0, [R5], #1
+                
+                ; Write decimal point
+                MOV     R0, #0x2E       ; '.'
+                STRB    R0, [R5], #1
+                
+                ; Write fractional digit
+                ADD     R0, R4, #0x30
+                STRB    R0, [R5], #1
+                
+                ; Write " kOhm"
+                MOV     R0, #0x20       ; space
+                STRB    R0, [R5], #1
+                MOV     R0, #0x6B       ; 'k'
+                STRB    R0, [R5], #1
+                MOV     R0, #0x4F       ; 'O'
+                STRB    R0, [R5], #1
+                MOV     R0, #0x68       ; 'h'
+                STRB    R0, [R5], #1
+                MOV     R0, #0x6D       ; 'm'
+                STRB    R0, [R5], #1
+                MOV     R0, #0x00       ; null
+                STRB    R0, [R5]
+
+FormatResDone
+                POP     {R0-R7, PC}
+
+                LTORG
+
+
+; SystemClock_Config
+
+SystemClock_Config
+                PUSH    {R0-R2, LR}
+                
+                LDR     R0, =RCC_AHB1ENR
+                LDR     R1, [R0]
+                ORR     R1, R1, #0x03
+                STR     R1, [R0]
+                
+                LDR     R0, =RCC_APB1ENR
+                LDR     R1, [R0]
+                LDR     R2, =0x00200000
+                ORR     R1, R1, R2
+                STR     R1, [R0]
+                
+                LDR     R0, =RCC_APB2ENR
+                LDR     R1, [R0]
+                ORR     R1, R1, #0x0100
+                STR     R1, [R0]
+                
+                LDR     R0, =10000
+ClkDly          SUBS    R0, R0, #1
+                BNE     ClkDly
+                
+                POP     {R0-R2, PC}
+
+                LTORG
+
+
+; ADC1_GPIO_Init: PA1 as analog input
+
+ADC1_GPIO_Init
+                PUSH    {R0-R2, LR}
+                
+                LDR     R0, =GPIOA_MODER
+                LDR     R1, [R0]
+                ORR     R1, R1, #0x0C
+                STR     R1, [R0]
+                
+                POP     {R0-R2, PC}
+
+                LTORG
+
+
+; ADC1_Init: Single conversion, Channel 1, 12-bit
+
+ADC1_Init
+                PUSH    {R0-R2, LR}
+                
+                LDR     R0, =ADC1_SMPR2
+                LDR     R1, [R0]
+                BIC     R1, R1, #0x38
+                ORR     R1, R1, #0x20
+                STR     R1, [R0]
+                
+                LDR     R0, =ADC1_SQR1
+                LDR     R1, [R0]
+                LDR     R2, =0x00F00000
+                BIC     R1, R1, R2
+                STR     R1, [R0]
+                
+                LDR     R0, =ADC1_SQR3
+                LDR     R1, [R0]
+                BIC     R1, R1, #0x1F
+                ORR     R1, R1, #0x01
+                STR     R1, [R0]
+                
+                LDR     R0, =ADC1_CR1
+                MOV     R1, #0x00
+                STR     R1, [R0]
+                
+                LDR     R0, =ADC1_CR2
+                LDR     R1, =0x00000401
+                STR     R1, [R0]
+                
+                LDR     R0, =10000
+ADCStab         SUBS    R0, R0, #1
+                BNE     ADCStab
+                
+                POP     {R0-R2, PC}
+
+                LTORG
+
+
+; ADC1_Read: Returns 12-bit ADC value in R0
+
+ADC1_Read
+                PUSH    {R1-R2, LR}
+                
+                LDR     R0, =ADC1_CR2
+                LDR     R1, [R0]
+                LDR     R2, =0x40000000
+                ORR     R1, R1, R2
+                STR     R1, [R0]
+                
+WaitEOC
+                LDR     R0, =ADC1_SR
+                LDR     R1, [R0]
+                TST     R1, #0x02
+                BEQ     WaitEOC
+                
+                LDR     R0, =ADC1_DR
+                LDR     R0, [R0]
+                LDR     R1, =0x0FFF
+                AND     R0, R0, R1
+                
+                POP     {R1-R2, PC}
+
+                LTORG
+
+
+; UDiv: R0 = R0 / R1 (unsigned)
+
+UDiv
+                PUSH    {R1-R4, LR}
+                MOV     R2, R1
+                MOV     R3, #0
+                CMP     R2, #0
+                BEQ     UDivDone
+UDivLoop
+                CMP     R0, R2
+                BLO     UDivDone
+                SUB     R0, R0, R2
+                ADD     R3, R3, #1
+                B       UDivLoop
+UDivDone
+                MOV     R0, R3
+                POP     {R1-R4, PC}
+
+
+; I2C1_GPIO_Init
+
+I2C1_GPIO_Init
+                PUSH    {R0-R2, LR}
+                
+                LDR     R0, =GPIOB_MODER
+                LDR     R1, [R0]
+                LDR     R2, =0x000F0000
+                BIC     R1, R1, R2
+                LDR     R2, =0x000A0000
+                ORR     R1, R1, R2
+                STR     R1, [R0]
+                
+                LDR     R0, =GPIOB_OTYPER
+                LDR     R1, [R0]
+                ORR     R1, R1, #0x0300
+                STR     R1, [R0]
+                
+                LDR     R0, =GPIOB_OSPEEDR
+                LDR     R1, [R0]
+                LDR     R2, =0x000F0000
+                ORR     R1, R1, R2
+                STR     R1, [R0]
+                
+                LDR     R0, =GPIOB_PUPDR
+                LDR     R1, [R0]
+                LDR     R2, =0x000F0000
+                BIC     R1, R1, R2
+                LDR     R2, =0x00050000
+                ORR     R1, R1, R2
+                STR     R1, [R0]
+                
+                LDR     R0, =GPIOB_AFRH
+                LDR     R1, [R0]
+                BIC     R1, R1, #0xFF
+                ORR     R1, R1, #0x44
+                STR     R1, [R0]
+                
+                POP     {R0-R2, PC}
+
+                LTORG
+
+
+; I2C1_Init
+
+I2C1_Init
+                PUSH    {R0-R1, LR}
+                
+                LDR     R0, =I2C1_CR1
+                MOV     R1, #0
+                STR     R1, [R0]
+                
+                LDR     R0, =I2C1_CR1
+                LDR     R1, =0x8000
+                STR     R1, [R0]
+                MOV     R1, #0
+                STR     R1, [R0]
+                
+                LDR     R0, =I2C1_CR2
+                MOV     R1, #16
+                STR     R1, [R0]
+                
+                LDR     R0, =I2C1_CCR
+                MOV     R1, #0x50
+                STR     R1, [R0]
+                
+                LDR     R0, =I2C1_TRISE
+                MOV     R1, #17
+                STR     R1, [R0]
+                
+                LDR     R0, =I2C1_CR1
+                MOV     R1, #0x01
+                STR     R1, [R0]
+                
+                POP     {R0-R1, PC}
+
+                LTORG
+
+
+; I2C Low-Level Routines
+
+I2C_Start
+                PUSH    {R0-R1, LR}
+                LDR     R0, =I2C1_CR1
+                LDR     R1, [R0]
+                ORR     R1, R1, #0x0100
+                STR     R1, [R0]
+WaitSB
+                LDR     R0, =I2C1_SR1
+                LDR     R1, [R0]
+                TST     R1, #0x01
+                BEQ     WaitSB
+                POP     {R0-R1, PC}
+
+                LTORG
+
+I2C_SendAddr
+                PUSH    {R0-R2, LR}
+                MOV     R2, R0
+                LDR     R0, =I2C1_DR
+                STR     R2, [R0]
+WaitADDR
+                LDR     R0, =I2C1_SR1
+                LDR     R1, [R0]
+                TST     R1, #0x02
+                BEQ     WaitADDR
+                LDR     R0, =I2C1_SR1
+                LDR     R1, [R0]
+                LDR     R0, =I2C1_SR2
+                LDR     R1, [R0]
+                POP     {R0-R2, PC}
+
+                LTORG
+
+I2C_SendByte
+                PUSH    {R0-R2, LR}
+                MOV     R2, R0
+WaitTXE
+                LDR     R0, =I2C1_SR1
+                LDR     R1, [R0]
+                TST     R1, #0x80
+                BEQ     WaitTXE
+                LDR     R0, =I2C1_DR
+                STR     R2, [R0]
+WaitBTF
+                LDR     R0, =I2C1_SR1
+                LDR     R1, [R0]
+                TST     R1, #0x04
+                BEQ     WaitBTF
+                POP     {R0-R2, PC}
+
+                LTORG
+
+I2C_Stop
+                PUSH    {R0-R1, LR}
+                LDR     R0, =I2C1_CR1
+                LDR     R1, [R0]
+                ORR     R1, R1, #0x0200
+                STR     R1, [R0]
+                MOV     R0, #100
+StopDly         SUBS    R0, R0, #1
+                BNE     StopDly
+                POP     {R0-R1, PC}
+
+                LTORG
+
+
+; OLED_SendCommand: R0 = command byte
+
+OLED_SendCommand
+                PUSH    {R4, LR}
+                MOV     R4, R0
+                BL      I2C_Start
+                MOV     R0, #OLED_ADDR_W
+                BL      I2C_SendAddr
+                MOV     R0, #0x00
+                BL      I2C_SendByte
+                MOV     R0, R4
+                BL      I2C_SendByte
+                BL      I2C_Stop
+                POP     {R4, PC}
+
+
+; OLED_Init
+
+OLED_Init
+                PUSH    {R4, LR}
+                
+                MOV     R0, #0xAE
+                BL      OLED_SendCommand
+                MOV     R0, #0xD5
+                BL      OLED_SendCommand
+                MOV     R0, #0x80
+                BL      OLED_SendCommand
+                MOV     R0, #0xA8
+                BL      OLED_SendCommand
+                MOV     R0, #0x1F
+                BL      OLED_SendCommand
+                MOV     R0, #0xD3
+                BL      OLED_SendCommand
+                MOV     R0, #0x00
+                BL      OLED_SendCommand
+                MOV     R0, #0x40
+                BL      OLED_SendCommand
+                MOV     R0, #0x8D
+                BL      OLED_SendCommand
+                MOV     R0, #0x14
+                BL      OLED_SendCommand
+                MOV     R0, #0x20
+                BL      OLED_SendCommand
+                MOV     R0, #0x00
+                BL      OLED_SendCommand
+                MOV     R0, #0xA1
+                BL      OLED_SendCommand
+                MOV     R0, #0xC8
+                BL      OLED_SendCommand
+                MOV     R0, #0xDA
+                BL      OLED_SendCommand
+                MOV     R0, #0x02
+                BL      OLED_SendCommand
+                MOV     R0, #0x81
+                BL      OLED_SendCommand
+                MOV     R0, #0x8F
+                BL      OLED_SendCommand
+                MOV     R0, #0xD9
+                BL      OLED_SendCommand
+                MOV     R0, #0xF1
+                BL      OLED_SendCommand
+                MOV     R0, #0xDB
+                BL      OLED_SendCommand
+                MOV     R0, #0x40
+                BL      OLED_SendCommand
+                MOV     R0, #0xA4
+                BL      OLED_SendCommand
+                MOV     R0, #0xA6
+                BL      OLED_SendCommand
+                MOV     R0, #0xAF
+                BL      OLED_SendCommand
+                
+                POP     {R4, PC}
+
+                LTORG
+
+
+; OLED_ClearScreen
+
+OLED_ClearScreen
+                PUSH    {R4-R6, LR}
+                
+                LDR     R4, =DisplayBuffer
+                MOV     R5, #0
+                LDR     R6, =512
+ClrBuf
+                STRB    R5, [R4], #1
+                SUBS    R6, R6, #1
+                BNE     ClrBuf
+                
+                MOV     R4, #0
+ClrPageLoop
+                CMP     R4, #4
+                BEQ     ClrDone
+                MOV     R0, R4
+                ADD     R0, R0, #0xB0
+                BL      OLED_SendCommand
+                MOV     R0, #0x00
+                BL      OLED_SendCommand
+                MOV     R0, #0x10
+                BL      OLED_SendCommand
+                BL      I2C_Start
+                MOV     R0, #OLED_ADDR_W
+                BL      I2C_SendAddr
+                MOV     R0, #0x40
+                BL      I2C_SendByte
+                MOV     R5, #128
+ClrColLoop
+                MOV     R0, #0x00
+                BL      I2C_SendByte
+                SUBS    R5, R5, #1
+                BNE     ClrColLoop
+                BL      I2C_Stop
+                ADD     R4, R4, #1
+                B       ClrPageLoop
+ClrDone
+                POP     {R4-R6, PC}
+
+                LTORG
+
+
+; OLED_ClearBuffer
+
+OLED_ClearBuffer
+                PUSH    {R0-R2, LR}
+                LDR     R0, =DisplayBuffer
+                MOV     R1, #0
+                LDR     R2, =512
+ClrBuf2
+                STRB    R1, [R0], #1
+                SUBS    R2, R2, #1
+                BNE     ClrBuf2
+                POP     {R0-R2, PC}
+
+                LTORG
+
+
+; OLED_UpdateDisplay
+
+OLED_UpdateDisplay
+                PUSH    {R4-R6, LR}
+                MOV     R4, #0
+                LDR     R5, =DisplayBuffer
+UpdPageLoop
+                CMP     R4, #4
+                BEQ     UpdDone
+                MOV     R0, R4
+                ADD     R0, R0, #0xB0
+                BL      OLED_SendCommand
+                MOV     R0, #0x00
+                BL      OLED_SendCommand
+                MOV     R0, #0x10
+                BL      OLED_SendCommand
+                BL      I2C_Start
+                MOV     R0, #OLED_ADDR_W
+                BL      I2C_SendAddr
+                MOV     R0, #0x40
+                BL      I2C_SendByte
+                MOV     R6, #128
+UpdColLoop
+                LDRB    R0, [R5], #1
+                BL      I2C_SendByte
+                SUBS    R6, R6, #1
+                BNE     UpdColLoop
+                BL      I2C_Stop
+                ADD     R4, R4, #1
+                B       UpdPageLoop
+UpdDone
+                POP     {R4-R6, PC}
+
+                LTORG
+
+
+; OLED_DrawString
+; R0 = string ptr, R1 = x, R2 = page
+
+OLED_DrawString
+                PUSH    {R4-R8, LR}
+                MOV     R4, R0
+                MOV     R5, R1
+                MOV     R6, R2
+DStrLoop
+                LDRB    R7, [R4], #1
+                CMP     R7, #0
+                BEQ     DStrDone
+                CMP     R7, #32
+                BLT     DStrDone
+                CMP     R7, #127
+                BGT     DStrDone
+                SUB     R0, R7, #32
+                MOV     R1, #5
+                MUL     R0, R0, R1
+                LDR     R1, =Font5x7
+                ADD     R8, R1, R0
+                MOV     R0, R6
+                LSL     R0, R0, #7
+                ADD     R0, R0, R5
+                LDR     R1, =DisplayBuffer
+                ADD     R1, R1, R0
+                LDRB    R0, [R8, #0]
+                STRB    R0, [R1, #0]
+                LDRB    R0, [R8, #1]
+                STRB    R0, [R1, #1]
+                LDRB    R0, [R8, #2]
+                STRB    R0, [R1, #2]
+                LDRB    R0, [R8, #3]
+                STRB    R0, [R1, #3]
+                LDRB    R0, [R8, #4]
+                STRB    R0, [R1, #4]
+                ADD     R5, R5, #6
+                B       DStrLoop
+DStrDone
+                POP     {R4-R8, PC}
+
+                LTORG
+
+
+; DATA SECTION (in RAM)
+
+                AREA    mydata, DATA, READWRITE
+                ALIGN
+
+DisplayBuffer   SPACE   512
+ResBuf          SPACE   20
+
+
+; READ-ONLY DATA SECTION
+
+                AREA    constdata, DATA, READONLY
+                ALIGN
+
+Msg_Title       DCB     "OHM METER", 0
+                ALIGN
+Msg_Error       DCB     "No Resistor", 0
+                ALIGN
+
+
+; 5x7 Font Table (ASCII 32 to 127)
+
+Font5x7
+        DCB     0x00,0x00,0x00,0x00,0x00  ; 32: space
+        DCB     0x00,0x00,0x5F,0x00,0x00  ; 33: !
+        DCB     0x00,0x07,0x00,0x07,0x00  ; 34: "
+        DCB     0x14,0x7F,0x14,0x7F,0x14  ; 35: #
+        DCB     0x24,0x2A,0x7F,0x2A,0x12  ; 36: $
+        DCB     0x23,0x13,0x08,0x64,0x62  ; 37: %
+        DCB     0x36,0x49,0x55,0x22,0x50  ; 38: &
+        DCB     0x00,0x05,0x03,0x00,0x00  ; 39: '
+        DCB     0x00,0x1C,0x22,0x41,0x00  ; 40: (
+        DCB     0x00,0x41,0x22,0x1C,0x00  ; 41: )
+        DCB     0x14,0x08,0x3E,0x08,0x14  ; 42: *
+        DCB     0x08,0x08,0x3E,0x08,0x08  ; 43: +
+        DCB     0x00,0x50,0x30,0x00,0x00  ; 44: ,
+        DCB     0x08,0x08,0x08,0x08,0x08  ; 45: -
+        DCB     0x00,0x60,0x60,0x00,0x00  ; 46: .
+        DCB     0x20,0x10,0x08,0x04,0x02  ; 47: /
+        DCB     0x3E,0x51,0x49,0x45,0x3E  ; 48: 0
+        DCB     0x00,0x42,0x7F,0x40,0x00  ; 49: 1
+        DCB     0x42,0x61,0x51,0x49,0x46  ; 50: 2
+        DCB     0x21,0x41,0x45,0x4B,0x31  ; 51: 3
+        DCB     0x18,0x14,0x12,0x7F,0x10  ; 52: 4
+        DCB     0x27,0x45,0x45,0x45,0x39  ; 53: 5
+        DCB     0x3C,0x4A,0x49,0x49,0x30  ; 54: 6
+        DCB     0x01,0x71,0x09,0x05,0x03  ; 55: 7
+        DCB     0x36,0x49,0x49,0x49,0x36  ; 56: 8
+        DCB     0x06,0x49,0x49,0x29,0x1E  ; 57: 9
+        DCB     0x00,0x36,0x36,0x00,0x00  ; 58: :
+        DCB     0x00,0x56,0x36,0x00,0x00  ; 59: ;
+        DCB     0x08,0x14,0x22,0x41,0x00  ; 60: <
+        DCB     0x14,0x14,0x14,0x14,0x14  ; 61: =
+        DCB     0x00,0x41,0x22,0x14,0x08  ; 62: >
+        DCB     0x02,0x01,0x51,0x09,0x06  ; 63: ?
+        DCB     0x32,0x49,0x79,0x41,0x3E  ; 64: @
+        DCB     0x7E,0x11,0x11,0x11,0x7E  ; 65: A
+        DCB     0x7F,0x49,0x49,0x49,0x36  ; 66: B
+        DCB     0x3E,0x41,0x41,0x41,0x22  ; 67: C
+        DCB     0x7F,0x41,0x41,0x22,0x1C  ; 68: D
+        DCB     0x7F,0x49,0x49,0x49,0x41  ; 69: E
+        DCB     0x7F,0x09,0x09,0x09,0x01  ; 70: F
+        DCB     0x3E,0x41,0x49,0x49,0x7A  ; 71: G
+        DCB     0x7F,0x08,0x08,0x08,0x7F  ; 72: H
+        DCB     0x00,0x41,0x7F,0x41,0x00  ; 73: I
+        DCB     0x20,0x40,0x41,0x3F,0x01  ; 74: J
+        DCB     0x7F,0x08,0x14,0x22,0x41  ; 75: K
+        DCB     0x7F,0x40,0x40,0x40,0x40  ; 76: L
+        DCB     0x7F,0x02,0x0C,0x02,0x7F  ; 77: M
+        DCB     0x7F,0x04,0x08,0x10,0x7F  ; 78: N
+        DCB     0x3E,0x41,0x41,0x41,0x3E  ; 79: O
+        DCB     0x7F,0x09,0x09,0x09,0x06  ; 80: P
+        DCB     0x3E,0x41,0x51,0x21,0x5E  ; 81: Q
+        DCB     0x7F,0x09,0x19,0x29,0x46  ; 82: R
+        DCB     0x46,0x49,0x49,0x49,0x31  ; 83: S
+        DCB     0x01,0x01,0x7F,0x01,0x01  ; 84: T
+        DCB     0x3F,0x40,0x40,0x40,0x3F  ; 85: U
+        DCB     0x1F,0x20,0x40,0x20,0x1F  ; 86: V
+        DCB     0x3F,0x40,0x38,0x40,0x3F  ; 87: W
+        DCB     0x63,0x14,0x08,0x14,0x63  ; 88: X
+        DCB     0x07,0x08,0x70,0x08,0x07  ; 89: Y
+        DCB     0x61,0x51,0x49,0x45,0x43  ; 90: Z
+        DCB     0x00,0x7F,0x41,0x41,0x00  ; 91: [
+        DCB     0x02,0x04,0x08,0x10,0x20  ; 92: backslash
+        DCB     0x00,0x41,0x41,0x7F,0x00  ; 93: ]
+        DCB     0x04,0x02,0x01,0x02,0x04  ; 94: ^
+        DCB     0x40,0x40,0x40,0x40,0x40  ; 95: _
+        DCB     0x00,0x01,0x02,0x04,0x00  ; 96: `
+        DCB     0x20,0x54,0x54,0x54,0x78  ; 97: a
+        DCB     0x7F,0x48,0x44,0x44,0x38  ; 98: b
+        DCB     0x38,0x44,0x44,0x44,0x20  ; 99: c
+        DCB     0x38,0x44,0x44,0x48,0x7F  ; 100: d
+        DCB     0x38,0x54,0x54,0x54,0x18  ; 101: e
+        DCB     0x08,0x7E,0x09,0x01,0x02  ; 102: f
+        DCB     0x0C,0x52,0x52,0x52,0x3E  ; 103: g
+        DCB     0x7F,0x08,0x04,0x04,0x78  ; 104: h
+        DCB     0x00,0x44,0x7D,0x40,0x00  ; 105: i
+        DCB     0x20,0x40,0x44,0x3D,0x00  ; 106: j
+        DCB     0x7F,0x10,0x28,0x44,0x00  ; 107: k
+        DCB     0x00,0x41,0x7F,0x40,0x00  ; 108: l
+        DCB     0x7C,0x04,0x78,0x04,0x78  ; 109: m
+        DCB     0x7C,0x08,0x04,0x04,0x78  ; 110: n
+        DCB     0x38,0x44,0x44,0x44,0x38  ; 111: o
+        DCB     0x7C,0x14,0x14,0x14,0x08  ; 112: p
+        DCB     0x08,0x14,0x14,0x18,0x7C  ; 113: q
+        DCB     0x7C,0x08,0x04,0x04,0x08  ; 114: r
+        DCB     0x48,0x54,0x54,0x54,0x20  ; 115: s
+        DCB     0x04,0x3F,0x44,0x40,0x20  ; 116: t
+        DCB     0x3C,0x40,0x40,0x20,0x7C  ; 117: u
+        DCB     0x1C,0x20,0x40,0x20,0x1C  ; 118: v
+        DCB     0x3C,0x40,0x30,0x40,0x3C  ; 119: w
+        DCB     0x44,0x28,0x10,0x28,0x44  ; 120: x
+        DCB     0x0C,0x50,0x50,0x50,0x3C  ; 121: y
+        DCB     0x44,0x64,0x54,0x4C,0x44  ; 122: z
+        DCB     0x00,0x08,0x36,0x41,0x00  ; 123: {
+        DCB     0x00,0x00,0x7F,0x00,0x00  ; 124: |
+        DCB     0x00,0x41,0x36,0x08,0x00  ; 125: }
+        DCB     0x10,0x08,0x08,0x10,0x08  ; 126: ~
+        DCB     0x00,0x00,0x00,0x00,0x00  ; 127: DEL
+
+                END
