@@ -1,0 +1,56 @@
+; Register Map
+RCC_AHB1ENR  EQU  0x40023830   ; Clock enable register
+GPIOA_MODER  EQU  0x40020000   ; Port A mode register
+GPIOA_OTYPER EQU  0x40020004   ; Port A output type register
+GPIOA_OSPEEDR EQU 0x40020008   ; Port A output speed register
+GPIOA_ODR    EQU  0x40020014   ; Port A output data register
+
+LED_ON       EQU  0x00000020   ; PA5 bit high  (bit 5 = 1)
+LED_OFF      EQU  0x00000000   ; PA5 bit low   (bit 5 = 0)
+DELAY_COUNT  EQU  500000       ; Software delay loop count (~0.5 s)
+
+	AREA  MYCODE, CODE, READONLY
+    EXPORT __main
+	ENTRY
+__main
+;Setup GPIOA
+    ; Turn on clock for GPIOA (RCC_AHB1ENR, set bit 0)
+    LDR  R0, =RCC_AHB1ENR
+    LDR  R1, =0x00000001
+    STR  R1, [R0]
+    ; Set PA5 as output (write 01 to MODER bits 11:10 = 0x400)
+    LDR  R0, =GPIOA_MODER
+    LDR  R1, =0x00000400
+    STR  R1, [R0]
+    ; Configure PA5 output as push-pull (OTYPER bit 5 cleared)
+    LDR  R0, =GPIOA_OTYPER
+    LDR  R1, =0x00000000
+    STR  R1, [R0]
+    ; Set PA5 to low speed mode (OSPEEDR bits 11:10 both 0)
+    LDR  R0, =GPIOA_OSPEEDR
+    LDR  R1, =0x00000000
+    STR  R1, [R0]
+; Main blink loop
+LOOP
+    ; Switch LED on by setting bit 5 high in ODR
+    LDR  R0, =GPIOA_ODR
+    LDR  R1, =LED_ON
+    STR  R1, [R0]
+    ; Waiting period
+    LDR  R2, =DELAY_COUNT
+DELAY1
+    SUBS R2, R2, #1
+    BNE  DELAY1
+    ; Switch LED off by clearing bit 5 in ODR
+    LDR  R0, =GPIOA_ODR
+    LDR  R1, =LED_OFF
+    STR  R1, [R0]
+    ; Waiting period
+    LDR  R2, =DELAY_COUNT
+DELAY2
+    SUBS R2, R2, #1
+    BNE  DELAY2
+    B    LOOP          ; Loop back to start indefinitely
+
+	ALIGN
+    END
