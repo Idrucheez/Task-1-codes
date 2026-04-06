@@ -1,0 +1,42 @@
+; Register Map
+RCC_AHB1ENR   EQU  0x40023830    ; AHB1 peripheral clock register
+GPIOB_MODER   EQU  0x40020400    ; Port B pin mode config register
+GPIOB_OTYPER  EQU  0x40020404    ; Port B output type config register
+GPIOB_OSPEEDR EQU  0x40020408    ; Port B pin speed config register
+GPIOB_BSRR    EQU  0x40020418    ; Port B atomic bit set/reset register
+LED_ON        EQU  0x00000001    ; Drive PB0 high via bit 0 (LED on)
+
+    AREA  MYCODE, CODE, READONLY
+    EXPORT __main
+    ENTRY
+__main
+; Configure GPIOB
+    ; Activate GPIOB clock by setting bit 1 in RCC_AHB1ENR
+    LDR  R0, =RCC_AHB1ENR
+    LDR  R1, =0x00000002
+    STR  R1, [R0]
+    ; Set PB0 as general-purpose output (MODER bits 1:0 = 01, value 0x1)
+    LDR  R0, =GPIOB_MODER
+    LDR  R1, =0x00000001
+    STR  R1, [R0]
+    ; Select push-pull driver for PB0 (OTYPER bit 0 cleared to 0)
+    LDR  R0, =GPIOB_OTYPER
+    LDR  R1, =0x00000000
+    STR  R1, [R0]
+    ; Keep PB0 at low speed (OSPEEDR bits 1:0 both cleared to 0)
+    LDR  R0, =GPIOB_OSPEEDR
+    LDR  R1, =0x00000000
+    STR  R1, [R0]
+; Turn LED on and hold
+    ; Assert PB0 high through BSRR bit 0 to illuminate LED
+    LDR  R0, =GPIOB_BSRR
+    LDR  R1, =LED_ON
+    STR  R1, [R0]
+; Idle loop
+LOOP
+    ; No blinking required, processor is held here
+    ; in a permanent loop while the LED remains lit.
+    B    LOOP          
+    
+    ALIGN
+    END
